@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+Pulls the latest MapTap scores for Ashley, Beth, and Kaitlyn and updates
+the `reportData` JSON embedded in fam/index.html.
+"""
+
+import json
+import statistics
+from pathlib import Path
+
+import requests
+
+TARGET_FILE = Path("fam/index.html")  # adjust to match your repo layout
+
+API_URL = "https://us-central1-jjexperiment-12af6.cloudfunctions.net/getPublicProfile"
+
+PLAYERS = {
+    "Ashley": {"nickname": "ash_zee2", "color": "#d946ef"},
+    "Beth": {"nickname": "MBZ", "color": "#38bdf8"},
+    "Kaitlyn": {"nickname": "DaBestKaitlyn", "color": "#fb923c"},
+}
+
+
+def fetch_profile(nickname: str) -> dict:
+    """Calls the same endpoint your coworker's curl example uses."""
+    resp = requests.post(
+        API_URL,
+        headers={"Content-Type": "application/json"},
+        json={"data": {"nickname": nickname}},
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    # Firebase "callable function" responses are usually wrapped like
+    # {"result": {...actual data...}}. Leaving this here as a guess —
+    # print(payload) the first time this runs for real and adjust if
+    # the real shape is different.
+    return payload.get("result", payload)
+
+
+def extract_history(profile: dict) -> list[dict]:
+    """
+    *** NOT IMPLEMENTED YET ***
+    Should return [{"date": "Jul 30", "score": 976}, ...] pulled out of
+    whatever `profile` actually contains. I don't know the real field
+    names yet (score_history? games? daily_scores?) — need to see one
+    real response first.
+    """
+    raise NotImplementedError("extract_history() needs the real response shape")
+
+
+def compute_person_stats(name, color, history):
+    """Recompute the per-person summary stats block from raw history."""
+    scores = [h["score"] for h in history]
+    if not scores:
+        return {
+            "name": name, "color": color, "verified": True, "games": 0,
+            "avg": None, "median": None, "high": None, "low": None,
+            "wins": 0, "seconds": 0, "losses": 0, "flags": 0, "ghost_days": 0,
+            "hundreds": 0, "nickname": "Just Joined",
+            "blurb": "Just joined the family roster \u2014 first game pending!",
+        }
+    return {
+        "name": name,
+        "color": color,
+        "verified": True,
+        "games": len(scores),
+        "avg": round(statistics.mean(scores), 1),
+        "median": statistics.median(scores),
+        "high": max(scores),
+        "low": min(scores),
+        "flags": 0,
+        "ghost_days": 0,
+        # wins / seconds / losses need a day-by-day comparison across
+        # everyone in the family, and "hundreds" needs per-round
+        # breakdown data (not just the final score) — depends on what
+        # extract_history() ends up giving us.
+    }
+
+
+def main():
+    content = TARGET_FILE.read_text()
+    lines = content.split("\n")
+
+    line_idx = next(i for i, l in enumerate(lines) if "const reportData = " in l)
+    line = lines[line_idx]
+    start = line.index("{")
+    end = line.rindex("};")
+    prefix = line[:start]
+    data = json.loads(line[start:end + 1])
+
+    for name, info in PLAYERS.items():
+        profile = fetch_profile(info["nickname"])
+        history = extract_history(profile)
+        stats = compute_person_stats(name, info["color"], history)
+        # TODO: merge `stats` into data["person_stats"], and merge
+        # `history` into data["series"] / data["raw_log"] / data["boxplot"]
+        # / data["group_stats"] the same way it was done by hand earlier
+        # in this conversation, once the shapes above are real.
+
+    new_line = prefix + json.dumps(data, ensure_ascii=False) + ";"
+    lines[line_idx] = new_line
+    TARGET_FILE.write_text("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
