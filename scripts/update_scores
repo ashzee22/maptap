@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-TARGET_FILE = Path("fam/index.html")  # adjust path if your repo layout differs
+TARGET_FILE = Path("index.html")  # adjust path if your repo layout differs
 
 API_URL = "https://us-central1-jjexperiment-12af6.cloudfunctions.net/getPublicProfile"
 
