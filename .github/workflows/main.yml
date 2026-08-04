@@ -25,7 +25,7 @@ jobs:
         run: pip install requests
 
       - name: Pull latest scores and update site
-        run: python scripts/update_scores.py
+        run: python scripts/update_scores
 
       - name: Commit and push if anything changed
         run: |
