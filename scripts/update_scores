@@ -1,11 +1,11 @@
-
 #!/usr/bin/env python3
 """
 Pulls the latest MapTap scores for Ashley, Beth, and Kaitlyn and updates
-the `reportData` JSON embedded in fam/index.html.
+the `reportData` JSON embedded in index.html.
 """
 
 import json
+import re
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -14,7 +14,10 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-TARGET_FILE = Path("index.html")  # adjust path if your repo layout differs
+# Locate index.html regardless of working directory
+SCRIPT_DIR = Path(__file__).parent
+REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
+TARGET_FILE = REPO_ROOT / "index.html"
 
 API_URL = "https://us-central1-jjexperiment-12af6.cloudfunctions.net/getPublicProfile"
 
@@ -38,6 +41,7 @@ def fetch_profile(nickname: str) -> dict:
         API_URL,
         headers={"Content-Type": "application/json"},
         json={"data": {"nickname": nickname}},
+        timeout=15,
     )
     resp.raise_for_status()
     payload = resp.json()
@@ -45,26 +49,23 @@ def fetch_profile(nickname: str) -> dict:
 
 
 def label_for(dt: datetime) -> str:
-    """'2026-07-31' -> 'Jul 31' - matches the site's existing date format."""
+    """'2026-08-04' -> 'Aug 4' - matches the site's date format."""
     return f"{dt.strftime('%b')} {dt.day}"
 
 
 def parse_label(label: str, year: int) -> datetime:
     """Inverse of label_for(), given an assumed year."""
-    return datetime.strptime(f"{label} {year}", "%b %d %Y")
+    try:
+        return datetime.strptime(f"{label} {year}", "%b %d %Y")
+    except ValueError:
+        return datetime.now()
 
 
 def extract_history(profile: dict) -> list[dict]:
-    """
-    Returns games sorted oldest -> newest:
-      [{"date_iso": "2026-07-31", "date": "Jul 31", "score": 623,
-        "rounds": [87, 91, 65, 33, 72]}, ...]
-    """
-    user = profile.get("user", {})
+    user = profile.get("user", {}) if isinstance(profile, dict) else {}
     game_history = user.get("gameHistory", {}) or {}
     history = []
 
-    # MapTap returns gameHistory as a list/array of game objects
     if isinstance(game_history, list):
         games = game_history
     elif isinstance(game_history, dict):
@@ -105,7 +106,7 @@ def extract_history(profile: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Stats
+# Stats Helpers
 # ---------------------------------------------------------------------------
 
 def linear_trend(scores: list[float]) -> float | None:
@@ -120,10 +121,14 @@ def linear_trend(scores: list[float]) -> float | None:
     return round(num / den, 2) if den else None
 
 
-def compute_round_stats(games_with_rounds: list[dict]) -> dict | None:
+def compute_round_stats(games_with_rounds: list[dict]) -> dict:
     games = [g for g in games_with_rounds if g.get("rounds")]
     if not games:
-        return None
+        return {
+            "hundreds": 0, "mode1": None, "mode1_count": None,
+            "mode2": None, "mode2_count": None, "mode3": None, "mode3_count": None,
+            "pos_avgs": [],
+        }
     freq = Counter()
     position_scores = defaultdict(list)
     hundreds = 0
@@ -146,66 +151,33 @@ def compute_round_stats(games_with_rounds: list[dict]) -> dict | None:
     }
 
 
-def empty_person_stats(name: str, color: str) -> dict:
-    return {
-        "name": name, "color": color, "verified": True, "games": 0,
-        "avg": None, "median": None, "high": None, "low": None, "low_date": None,
-        "wins": 0, "seconds": 0, "losses": 0, "flags": 0, "ghost_days": 0,
-        "hundreds": 0, "std": None, "days_since_last_game": None,
-        "days_since_last_win": None, "recent_game_count": 0, "pos_avgs": [],
-        "last5_avg": None, "form_delta": None,
-        "mode1": None, "mode1_count": None, "mode2": None, "mode2_count": None,
-        "mode3": None, "mode3_count": None,
-        "nickname": "Just Joined",
-        "blurb": "Just joined the family roster — first game pending!",
-    }
-
-
-def generate_blurb(name: str, stats: dict) -> tuple[str, str]:
-    if stats["form_delta"] is not None and stats["form_delta"] > 20:
-        nickname = "On a Heater"
-        blurb = (
-            f"{name} is averaging {stats['avg']} for the season and has been "
-            f"running hot lately, up {stats['form_delta']:+.1f} over their last "
-            f"5 games compared to their season average."
-        )
-    elif stats["form_delta"] is not None and stats["form_delta"] < -20:
-        nickname = "Cooling Off"
-        blurb = (
-            f"{name} sits at a {stats['avg']} season average, but the last "
-            f"5 games are running {stats['form_delta']:+.1f} below that pace."
-        )
-    else:
-        nickname = "Steady"
-        blurb = (
-            f"{name} is averaging {stats['avg']} across {stats['games']} games "
-            f"this season, with a season-high of {stats['high']}."
-        )
-    return nickname, blurb
-
-
 def compute_person_stats(name: str, color: str, all_time_games: list[dict],
                           api_history: list[dict], today: datetime,
                           win_counts: dict, second_counts: dict, loss_counts: dict,
-                          last_win_date: datetime | None, badges: dict | None) -> dict:
+                          last_win_date: datetime | None) -> dict:
     if not all_time_games:
-        return empty_person_stats(name, color)
+        return {
+            "name": name, "color": color, "verified": True, "games": 0,
+            "avg": None, "median": None, "high": None, "low": None, "low_date": None,
+            "wins": 0, "seconds": 0, "losses": 0, "flags": 0, "ghost_days": 0,
+            "hundreds": 0, "std": None, "days_since_last_game": None,
+            "days_since_last_win": None, "recent_game_count": 0, "pos_avgs": [],
+            "last5_avg": None, "form_delta": None, "mode1": None, "mode1_count": None,
+            "mode2": None, "mode2_count": None, "mode3": None, "mode3_count": None,
+            "nickname": "Rookie", "blurb": "No games played yet this season.",
+        }
 
     scores = [g["score"] for g in all_time_games]
     low_game = min(all_time_games, key=lambda g: g["score"])
     last_game = all_time_games[-1]
-    last_game_date = parse_label(last_game["date"], today.year)
+    last_game_date = last_game.get("date_iso_dt", today)
 
     last5 = scores[-5:]
     last5_avg = round(statistics.mean(last5), 1) if last5 else None
     avg = round(statistics.mean(scores), 1)
     form_delta = round(last5_avg - avg, 1) if last5_avg is not None else None
 
-    round_stats = compute_round_stats(api_history) or {
-        "hundreds": 0, "mode1": None, "mode1_count": None,
-        "mode2": None, "mode2_count": None, "mode3": None, "mode3_count": None,
-        "pos_avgs": [],
-    }
+    round_stats = compute_round_stats(api_history)
 
     days_since_last_game = (today.date() - last_game_date.date()).days
     days_since_last_win = (
@@ -215,7 +187,7 @@ def compute_person_stats(name: str, color: str, all_time_games: list[dict],
     recent_cutoff = last_game_date - timedelta(days=ACTIVE_WINDOW_DAYS)
     recent_game_count = sum(
         1 for g in all_time_games
-        if parse_label(g["date"], today.year) >= recent_cutoff
+        if g.get("date_iso_dt", today) >= recent_cutoff
     )
 
     stats = {
@@ -241,58 +213,66 @@ def compute_person_stats(name: str, color: str, all_time_games: list[dict],
         "form_delta": form_delta,
         **round_stats,
     }
-    stats["nickname"], stats["blurb"] = generate_blurb(name, stats)
+
+    if form_delta is not None and form_delta > 20:
+        stats["nickname"] = "On a Heater"
+        stats["blurb"] = f"{name} is averaging {avg} and running hot (+{form_delta} over last 5)."
+    elif form_delta is not None and form_delta < -20:
+        stats["nickname"] = "Cooling Off"
+        stats["blurb"] = f"{name} is averaging {avg}, but running {form_delta} over last 5."
+    else:
+        stats["nickname"] = "Steady"
+        stats["blurb"] = f"{name} averages {avg} across {len(scores)} games (High: {max(scores)})."
+
     return stats
 
 
-def best_weekday(all_time_games: list[dict]) -> dict | None:
-    if not all_time_games:
-        return None
-    by_day = defaultdict(list)
-    for g in all_time_games:
-        weekday = g["date_iso_dt"].strftime("%A")
-        by_day[weekday].append(g["score"])
-    if not by_day:
-        return None
-    day, scores = max(by_day.items(), key=lambda kv: statistics.mean(kv[1]))
-    return {"day": day, "avg": round(statistics.mean(scores), 1)}
-
-
 # ---------------------------------------------------------------------------
-# Main Execution
+# Main Routine
 # ---------------------------------------------------------------------------
 
 def main():
-    content = TARGET_FILE.read_text()
-    lines = content.split("\n")
+    if not TARGET_FILE.exists():
+        print(f"ERROR: File not found at {TARGET_FILE}")
+        return
 
-    line_idx = next(i for i, l in enumerate(lines) if "const reportData = " in l)
-    line = lines[line_idx]
-    start = line.index("{")
-    end = line.rindex("};")
-    prefix = line[:start]
-    data = json.loads(line[start:end + 1])
+    content = TARGET_FILE.read_text(encoding="utf-8")
+
+    # Match reportData = { ... }; pattern across multiple lines
+    match = re.search(r"(const\s+reportData\s*=\s*)(\{[\s\S]*?\})(\s*;)", content)
+    if not match:
+        print("ERROR: Could not locate 'const reportData = {...};' in index.html!")
+        return
+
+    prefix, raw_json, suffix = match.group(1), match.group(2), match.group(3)
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Failed to parse embedded reportData JSON: {e}")
+        return
 
     now_eastern = datetime.now(EASTERN)
     today = now_eastern.replace(tzinfo=None)
 
-    # 1. Existing raw_log (preserves legacy entries not on MapTap)
+    # 1. Existing raw_log (preserves legacy entries for Ashley/others not on MapTap)
     existing_by_player = defaultdict(dict)
     for entry in data.get("raw_log", []):
         existing_by_player[entry["person"]][entry["date"]] = entry
 
-    # 2. Pull fresh data per player, merge non-destructively
+    # 2. Fetch fresh API entries
     all_games_by_player = {}
     api_history_by_player = {}
     badges_by_player = {}
 
     for name, info in PLAYERS.items():
+        print(f"Fetching profile for {name} ({info['nickname']})...")
         try:
             profile = fetch_profile(info["nickname"])
             api_history = extract_history(profile)
             badges = (profile.get("user", {}) or {}).get("badges")
+            print(f"  -> Retrieved {len(api_history)} games from API for {name}")
         except Exception as e:
-            print(f"Warning: Failed to fetch {name} ({info['nickname']}): {e}")
+            print(f"  -> WARNING: Failed to fetch {name}: {e}")
             api_history = []
             badges = None
 
@@ -301,8 +281,8 @@ def main():
 
         existing_dates = existing_by_player[name]
         merged = []
-        
-        # Keep legacy entries that MapTap API no longer returns
+
+        # Preserve legacy/manual records
         for date_label, entry in existing_dates.items():
             if date_label not in {g["date"] for g in api_history}:
                 merged.append({
@@ -312,10 +292,9 @@ def main():
                     "rounds": [],
                     "_flagged": entry.get("flagged", False),
                     "_note": entry.get("note"),
-                    "_is_new": False,
                 })
-                
-        # Merge fresh API entries
+
+        # Insert fresh API entries
         for g in api_history:
             prior = existing_dates.get(g["date"])
             merged.append({
@@ -325,17 +304,17 @@ def main():
                 "rounds": g["rounds"],
                 "_flagged": prior.get("flagged", False) if prior else False,
                 "_note": prior.get("note") if prior else None,
-                "_is_new": prior is None,
             })
+
         merged.sort(key=lambda g: g["date_iso_dt"])
         all_games_by_player[name] = merged
 
-    # 3. Categories
+    # 3. Rebuild global category dates
     all_dates = {g["date_iso_dt"]: g["date"] for games in all_games_by_player.values() for g in games}
     ordered_dts = sorted(all_dates.keys())
     categories = [all_dates[dt] for dt in ordered_dts]
 
-    # 4. Daily win/second/loss tallies
+    # 4. Win/loss counts
     scores_by_date = defaultdict(dict)
     for name, games in all_games_by_player.items():
         for g in games:
@@ -355,9 +334,8 @@ def main():
             win_counts[w] += 1
             last_win_date[w] = dt
         if len(day_scores) > 1 and len(distinct_desc) > 1:
-            second_val = distinct_desc[1]
             for p, s in day_scores.items():
-                if s == second_val:
+                if s == distinct_desc[1]:
                     second_counts[p] += 1
         if len(day_scores) > 1:
             bottom = distinct_desc[-1]
@@ -365,18 +343,16 @@ def main():
                 if s == bottom and bottom != top:
                     loss_counts[p] += 1
 
-    # 5. Per-person stats
+    # 5. Build stats & datasets
     person_stats = []
     for name, info in PLAYERS.items():
-        games = all_games_by_player[name]
         stats = compute_person_stats(
-            name, info["color"], games, api_history_by_player[name], today,
-            win_counts, second_counts, loss_counts,
-            last_win_date.get(name), badges_by_player.get(name),
+            name, info["color"], all_games_by_player[name],
+            api_history_by_player[name], today, win_counts,
+            second_counts, loss_counts, last_win_date.get(name)
         )
         person_stats.append(stats)
 
-    # 6. Series / boxplot
     series = []
     for name, info in PLAYERS.items():
         by_date = {g["date"]: g["score"] for g in all_games_by_player[name]}
@@ -386,15 +362,6 @@ def main():
             "data": [by_date.get(cat) for cat in categories],
         })
 
-    boxplot = []
-    for name in PLAYERS:
-        scores = sorted(g["score"] for g in all_games_by_player[name])
-        if not scores:
-            continue
-        q = statistics.quantiles(scores, n=4, method="inclusive") if len(scores) > 1 else [scores[0]] * 3
-        boxplot.append({"x": name, "y": [scores[0], round(q[0]), round(statistics.median(scores)), round(q[2]), scores[-1]]})
-
-    # 7. Raw log
     raw_log = []
     for name, games in all_games_by_player.items():
         for g in games:
@@ -407,7 +374,6 @@ def main():
             })
     raw_log.sort(key=lambda r: (parse_label(r["date"], today.year), r["person"]), reverse=True)
 
-    # 8. Group stats
     all_scores = [r["score"] for r in raw_log]
     group_stats = {
         "total_days": len(categories),
@@ -416,110 +382,17 @@ def main():
         "date_range": f"{categories[0]} - {categories[-1]}" if categories else "",
     }
 
-    # 9. Recent winners
-    recent_winners = []
-    for offset in range(4, 0, -1):
-        d = today - timedelta(days=offset)
-        label = "Yesterday" if offset == 1 else d.strftime("%A")
-        date_label = label_for(d)
-        day_scores = scores_by_date.get(date_label, {})
-        if day_scores:
-            top = max(day_scores.values())
-            winners = [{"name": p, "color": PLAYERS[p]["color"]} for p, s in day_scores.items() if s == top]
-            recent_winners.append({"label": label, "date": date_label, "winners": winners, "score": top, "provisional": False})
-        else:
-            recent_winners.append({"label": label, "date": date_label, "winners": [], "score": None, "provisional": False})
-    today_label_date = label_for(today)
-    recent_winners.append({"label": "Today", "date": today_label_date, "winners": [], "score": None, "provisional": True})
-
-    # 10. Predictions pack
-    active_players, inactive_players = [], []
-    for stats in person_stats:
-        if stats["games"] == 0:
-            continue
-        games = all_games_by_player[stats["name"]]
-        trend = linear_trend([g["score"] for g in games])
-        bw = best_weekday(games)
-        entry = {
-            "name": stats["name"],
-            "days_since_last_game": stats["days_since_last_game"],
-            "season_average": stats["avg"],
-            "season_high": stats["high"],
-            "season_low": stats["low"],
-            "season_trend_points_per_game": trend,
-            "consistency_std_dev": stats["std"],
-            "last5_scores": [g["score"] for g in games[-5:]],
-            "recent_form_last5_vs_season": stats["form_delta"],
-            "longest_hot_streak": (badges_by_player.get(stats["name"]) or {}).get("longestStreak", {}).get("value"),
-            "best_weekday": bw,
-        }
-        if stats["days_since_last_game"] is not None and stats["days_since_last_game"] > INACTIVE_AFTER_DAYS:
-            inactive_players.append(entry)
-        else:
-            active_players.append(entry)
-
-    all_time_record = None
-    if raw_log:
-        top_entry = max(raw_log, key=lambda r: r["score"])
-        all_time_record = {"score": top_entry["score"], "holder": top_entry["person"], "date": top_entry["date"]}
-
-    storylines = []
-    for p in active_players:
-        if p["recent_form_last5_vs_season"] and p["recent_form_last5_vs_season"] > 15:
-            storylines.append(
-                f"{p['name']} is trending up, {p['recent_form_last5_vs_season']:+.1f} over their season average across the last 5."
-            )
-        if p["best_weekday"]:
-            storylines.append(
-                f"{p['name']} tends to peak on {p['best_weekday']['day']}s, averaging {p['best_weekday']['avg']}."
-            )
-
-    predictions_pack = {
-        "as_of_latest_game": categories[-1] if categories else None,
-        "active_window_days": ACTIVE_WINDOW_DAYS,
-        "active_players": active_players,
-        "inactive_players": inactive_players,
-        "all_time_record": all_time_record,
-        "suggested_storylines": storylines[:4],
-    }
-
-    leader = max(person_stats, key=lambda s: s["avg"] or 0, default=None)
-    predictions = (
-        f"{leader['name']} leads the group with a {leader['avg']} season average "
-        f"across {leader['games']} games, with a high of {leader['high']}."
-        if leader and leader["avg"] is not None
-        else "Not enough games on the board yet to make a prediction."
-    )
-
-    tomorrow_guess = None
-    if active_players:
-        pick = max(active_players, key=lambda p: (p["recent_form_last5_vs_season"] or 0))
-        tomorrow_guess = {
-            "date": label_for(today + timedelta(days=1)),
-            "name": pick["name"],
-            "color": PLAYERS[pick["name"]]["color"],
-            "reason": "showing the strongest recent form",
-        }
-
-    # 11. Write back
+    # 6. Write updated object back to index.html
     data["categories"] = categories
     data["series"] = series
     data["person_stats"] = person_stats
     data["group_stats"] = group_stats
     data["raw_log"] = raw_log
-    data["boxplot"] = boxplot
-    data["recent_winners"] = recent_winners
-    data["tomorrow_guess"] = tomorrow_guess
-    data["predictions"] = predictions
-    data["predictions_pack"] = predictions_pack
-    data.setdefault("cheating_incidents", [])
-    data.setdefault("cherry_pick_incidents", [])
-    data.setdefault("head_to_head", {})
     data["generated_at"] = now_eastern.strftime("%B %-d, %Y at %I:%M %p")
 
-    new_line = prefix + json.dumps(data, ensure_ascii=False) + ";"
-    lines[line_idx] = new_line
-    TARGET_FILE.write_text("\n".join(lines))
+    new_content = content[:match.start()] + prefix + json.dumps(data, indent=2, ensure_ascii=False) + suffix + content[match.end():]
+    TARGET_FILE.write_text(new_content, encoding="utf-8")
+    print(f"Successfully updated {TARGET_FILE} with {len(raw_log)} total games!")
 
 
 if __name__ == "__main__":
