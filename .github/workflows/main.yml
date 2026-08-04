@@ -2,6 +2,7 @@ name: Update MapTap Scores
 
 on:
   schedule:
+    # Runs every hour at the top of the hour
     - cron: '0 * * * *'
   workflow_dispatch: {}
 
@@ -24,7 +25,7 @@ jobs:
         run: pip install requests
 
       - name: Pull latest scores and update site
-        run: python update_scores.py
+        run: python scripts/update_scores.py
 
       - name: Commit and push if anything changed
         run: |
