@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Pulls MapTap scores for Ashley, Beth, and Kaitlyn.
-- Stats board uses ALL games for player averages, medians, highs, lows, etc.
-- Wins, seconds, and losses ONLY count on days where >= 2 players submitted scores.
-- Dynamic game-show style scouting reports & predictions matching the classic vibe!
+Uses Gemini API to generate daily, creative, game-show style scouting reports and predictions.
 """
 
 import json
+import os
 import re
 import statistics
 from collections import Counter, defaultdict
@@ -15,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from google import genai
 
 SCRIPT_DIR = Path(__file__).parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
@@ -29,12 +29,7 @@ PLAYERS = {
 }
 
 EASTERN = ZoneInfo("America/New_York")
-ACTIVE_WINDOW_DAYS = 5
 
-
-# ---------------------------------------------------------------------------
-# API & Parsing
-# ---------------------------------------------------------------------------
 
 def fetch_profile(nickname: str) -> dict:
     resp = requests.post(
@@ -64,17 +59,11 @@ def extract_history(profile: dict) -> list[dict]:
     game_history = user.get("gameHistory", {}) or {}
     history = []
 
-    if isinstance(game_history, list):
-        games = game_history
-    elif isinstance(game_history, dict):
-        games = game_history.values()
-    else:
-        games = []
+    games = game_history if isinstance(game_history, list) else game_history.values() if isinstance(game_history, dict) else []
 
     for game in games:
         if not isinstance(game, dict):
             continue
-
         date_iso = game.get("date") or game.get("date_iso")
         score = game.get("finalScore")
 
@@ -86,12 +75,7 @@ def extract_history(profile: dict) -> list[dict]:
         except ValueError:
             continue
 
-        rounds = [
-            r["score"]
-            for r in game.get("rounds", [])
-            if isinstance(r, dict) and "score" in r
-        ]
-
+        rounds = [r["score"] for r in game.get("rounds", []) if isinstance(r, dict) and "score" in r]
         history.append({
             "date_iso": date_iso,
             "date": label_for(dt),
@@ -103,150 +87,47 @@ def extract_history(profile: dict) -> list[dict]:
     return history
 
 
-def compute_round_stats(games_with_rounds: list[dict]) -> dict:
-    games = [g for g in games_with_rounds if g.get("rounds")]
-    if not games:
-        return {
-            "hundreds": 0,
-            "mode1": None, "mode1_count": None,
-            "mode2": None, "mode2_count": None,
-            "mode3": None, "mode3_count": None,
-            "pos_avgs": [],
-        }
+def generate_gemini_content(player_data_summary: list[dict]) -> dict:
+    """Sends stats to Gemini API to get fresh, dramatic commentary."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("WARNING: GEMINI_API_KEY not found in environment. Skipping AI generation.")
+        return {}
 
-    freq = Counter()
-    position_scores = defaultdict(list)
-    hundreds = 0
+    client = genai.Client(api_key=api_key)
 
-    for game in games:
-        for i, rscore in enumerate(game["rounds"]):
-            freq[rscore] += 1
-            position_scores[i].append(rscore)
-            if rscore == 100:
-                hundreds += 1
+    prompt = f"""
+You are an over-the-top, energetic gameshow host and esports analyst commenting on a geography map-guessing league.
+Analyze the following player statistics and produce JSON output matching the schema strictly.
 
-    top3 = freq.most_common(3)
-    while len(top3) < 3:
-        top3.append((None, None))
+Player Stats Data:
+{json.dumps(player_data_summary, indent=2)}
 
-    pos_avgs = [round(statistics.mean(position_scores[i]), 1) for i in sorted(position_scores)]
+Requirements:
+1. "scouting": An array of objects for EVERY player with keys:
+   - "name": string
+   - "nickname": Short dynamic gameshow nickname (e.g., "The Triple-Point Titan", "The Map Monarch")
+   - "title": Full title with quotation marks (e.g., '"Ashley the Triple-Point Titan"')
+   - "blurb": 2-3 sentence theatrical, game-show summary referencing their stats (average, high, trend, volatility).
+   - "good": Single punchy sentence highlighting their top strength.
+   - "bad": Single punchy sentence highlighting their main vulnerability.
+2. "predictions": A markdown-formatted string starting with "🔥 **Next Week's Predictions**: " that EXPLICITLY mentions EVERY single player (Ashley, Beth, Kaitlyn) by name with commentary on their upcoming matchup.
 
-    return {
-        "hundreds": hundreds,
-        "mode1": top3[0][0], "mode1_count": top3[0][1],
-        "mode2": top3[1][0], "mode2_count": top3[1][1],
-        "mode3": top3[2][0], "mode3_count": top3[2][1],
-        "pos_avgs": pos_avgs,
-    }
+Return ONLY raw JSON, no markdown code blocks.
+"""
 
-
-# ---------------------------------------------------------------------------
-# Gameshow Scouting Report Generator
-# ---------------------------------------------------------------------------
-
-def generate_gameshow_scouting(name: str, avg: float | None, high: int | None, low: int | None, 
-                               form_delta: float | None, wins: int, std: float | None, games_count: int) -> dict:
-    if avg is None or games_count == 0:
-        return {
-            "nickname": "Rookie Wildcard",
-            "title": f'"{name} the Mystery Contender"',
-            "blurb": f"{name} is currently a phantom on the board with zero games logged! The crowd is waiting with bated breath to see if they debut with absolute glory or total map-reading mayhem.",
-            "good": "Zero scouting film for rivals to analyze.",
-            "bad": "Has yet to step up to the podium and drop a score."
-        }
-
-    # Dynamic Game-Show Player Titles
-    if avg >= 800:
-        nickname = "Triple-Point Titan"
-        title = f'"{name} the Map-Monarch"'
-    elif form_delta is not None and form_delta >= 15:
-        nickname = "On a Heater"
-        title = f'"{name} the Hot-Hand Heavyweight"'
-    elif form_delta is not None and form_delta <= -15:
-        nickname = "Cooling Off"
-        title = f'"{name} the Slump Survivor"'
-    elif std is not None and std > 45:
-        nickname = "Wild Card"
-        title = f'"{name} the Volatile Maverick"'
-    elif wins >= 3:
-        nickname = "Clutch Leader"
-        title = f'"{name} the Head-to-Head Executioner"'
-    else:
-        nickname = "Underdog Contender"
-        title = f'"{name} the Dark-Horse Disruptor"'
-
-    # Rich Game-Show Narrative Blurb
-    delta_str = f"+{form_delta}" if (form_delta is not None and form_delta > 0) else f"{form_delta}"
-    
-    if avg >= 800:
-        blurb = (
-            f"{name} stands as an absolute juggernaut on the stage, holding down a terrifying {avg:.1f} season average "
-            f"and throwing around a jaw-dropping peak score of {high}! "
-            f"Rivals shudder whenever they walk up to the map, though weathering a recent trend of {delta_str} points "
-            f"proves that even high-flying royalty isn't totally immune to the occasional cold breeze."
-        )
-    elif std is not None and std > 40:
-        blurb = (
-            f"Talk about high-stakes drama! {name} brings pure, unfiltered chaos to every round with a wild {std:.1f} standard deviation. "
-            f"They can electrify the room with a massive {high}-point masterpiece or send spectators gasping with a {low}-point disaster. "
-            f"A true roller-coaster player averaging {avg:.1f} who keeps every single match unpredictable!"
-        )
-    else:
-        blurb = (
-            f"{name} continues to quietly calculate their way up the leaderboards, carrying a respectable {avg:.1f} season average "
-            f"across {games_count} intense battles. Holding a peak of {high} points, they have shown flashes of pure brilliance, "
-            f"now sitting on {wins} official head-to-head victory crowns as they search for absolute consistency."
-        )
-
-    # Distinct Good & Bad Highlights
-    if high and high >= 850:
-        good = f"Unlimited firepower—capable of dropping terrifying {high}+ point nuclear scores."
-    elif form_delta is not None and form_delta > 0:
-        good = f"Riding serious momentum with a +{form_delta} boost over their standard average."
-    elif wins > 0:
-        good = f"Clutch instinct in multi-player showdowns, bagging {wins} official head-to-head wins."
-    else:
-        good = f"Solid baseline consistency anchoring a respectable {avg:.1f} point average."
-
-    if low and low < 550:
-        bad = f"Prone to catastrophic map-reading meltdowns (dipping down to a season low of {low})."
-    elif form_delta is not None and form_delta < 0:
-        bad = f"Currently leaking points, running {form_delta} below their usual seasonal pace."
-    elif std is not None and std > 35:
-        bad = f"High game-to-game volatility ({std:.1f} std dev) makes every performance a gamble."
-    else:
-        bad = f"Can play overly conservative when head-to-head scoreboard pressure heats up."
-
-    return {
-        "nickname": nickname,
-        "title": title,
-        "blurb": blurb,
-        "good": good,
-        "bad": bad,
-    }
-
-
-def generate_gameshow_predictions(person_stats: list[dict], categories: list[str]) -> str:
-    active = [p for p in person_stats if p.get("avg") is not None and p.get("games", 0) > 0]
-    if not active:
-        return "The arena is completely quiet! Awaiting initial scores before the forecasting computers can compute the upcoming drama."
-
-    top_player = max(active, key=lambda x: x["avg"])
-    hot_player = max(active, key=lambda x: x.get("form_delta") or -999)
-    high_game_player = max(active, key=lambda x: x.get("high") or 0)
-
-    prediction_text = (
-        f"{top_player['name']} enters the arena as the heavy favorite holding a commanding {top_player['avg']:.1f} average, "
-        f"but the pressure is boiling over! {hot_player['name']} is generating explosive heat on recent form, "
-        f"while {high_game_player['name']} lurks with a group-best {high_game_player['high']} high-score ceiling. "
-        f"Expect sparks to fly in the next multi-player showdown as the leaderboard crown hangs in the balance!"
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={"response_mime_type": "application/json"}
     )
-    return prediction_text
 
+    try:
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"Failed to parse Gemini output: {e}")
+        return {}
 
-# ---------------------------------------------------------------------------
-# Main Routine
-# ---------------------------------------------------------------------------
 
 def main():
     if not TARGET_FILE.exists():
@@ -254,7 +135,6 @@ def main():
         return
 
     content = TARGET_FILE.read_text(encoding="utf-8")
-
     match = re.search(r"(const\s+reportData\s*=\s*)(\{[\s\S]*?\})(\s*;)", content)
     if not match:
         print("ERROR: Could not locate 'const reportData = {...};' in index.html!")
@@ -266,183 +146,100 @@ def main():
     now_eastern = datetime.now(EASTERN)
     today = now_eastern.replace(tzinfo=None)
 
-    existing_by_player = defaultdict(dict)
-    for entry in data.get("raw_log", []):
-        existing_by_player[entry["person"]][entry["date"]] = entry
-
     all_games_by_player = {}
-    api_history_by_player = {}
-
     for name, info in PLAYERS.items():
         try:
             profile = fetch_profile(info["nickname"])
-            api_history = extract_history(profile)
+            all_games_by_player[name] = extract_history(profile)
         except Exception as e:
             print(f"Warning: Failed fetching {name}: {e}")
-            api_history = []
+            all_games_by_player[name] = []
 
-        api_history_by_player[name] = api_history
-        existing_dates = existing_by_player[name]
-        merged = []
-
-        for date_label, entry in existing_dates.items():
-            if date_label not in {g["date"] for g in api_history}:
-                merged.append({
-                    "date": date_label,
-                    "date_iso_dt": parse_label(date_label, today.year),
-                    "score": entry["score"],
-                    "rounds": [],
-                    "_flagged": entry.get("flagged", False),
-                    "_note": entry.get("note"),
-                })
-
-        for g in api_history:
-            prior = existing_dates.get(g["date"])
-            merged.append({
-                "date": g["date"],
-                "date_iso_dt": datetime.strptime(g["date_iso"], "%Y-%m-%d"),
-                "score": g["score"],
-                "rounds": g["rounds"],
-                "_flagged": prior.get("flagged", False) if prior else False,
-                "_note": prior.get("note") if prior else None,
-            })
-
-        merged.sort(key=lambda g: g["date_iso_dt"])
-        all_games_by_player[name] = merged
-
-    all_dates = {g["date_iso_dt"]: g["date"] for games in all_games_by_player.values() for g in games}
-    ordered_dts = sorted(all_dates.keys())
-    categories = [all_dates[dt] for dt in ordered_dts]
+    all_dates = {g["date_iso"]: g["date"] for games in all_games_by_player.values() for g in games}
+    categories = list(dict.fromkeys([g["date"] for games in all_games_by_player.values() for g in games]))
 
     scores_by_date = defaultdict(dict)
     for name, games in all_games_by_player.items():
         for g in games:
             scores_by_date[g["date"]][name] = g["score"]
 
-    # 1. WINS: Restricted strictly to dates with >= 2 players
-    win_counts, second_counts, loss_counts = defaultdict(int), defaultdict(int), defaultdict(int)
-    last_win_date = {}
-
-    for dt in ordered_dts:
-        date_label = all_dates[dt]
+    # Calculate wins
+    win_counts = defaultdict(int)
+    for date_label in categories:
         day_scores = scores_by_date.get(date_label, {})
-        
-        if len(day_scores) < 2:
-            continue
-
-        distinct_desc = sorted(set(day_scores.values()), reverse=True)
-        top = distinct_desc[0]
-        winners = [p for p, s in day_scores.items() if s == top]
-        for w in winners:
-            win_counts[w] += 1
-            last_win_date[w] = dt
-
-        if len(distinct_desc) > 1:
+        if len(day_scores) >= 2:
+            top_score = max(day_scores.values())
             for p, s in day_scores.items():
-                if s == distinct_desc[1]:
-                    second_counts[p] += 1
+                if s == top_score:
+                    win_counts[p] += 1
 
-        bottom = distinct_desc[-1]
-        for p, s in day_scores.items():
-            if s == bottom and bottom != top:
-                loss_counts[p] += 1
-
-    # 2. STATS BOARD: Takes ALL games into account for each player
     person_stats = []
+    stats_for_ai = []
+
     for name, info in PLAYERS.items():
         games = all_games_by_player[name]
         scores = [g["score"] for g in games]
-        api_hist = api_history_by_player[name]
 
         avg = round(statistics.mean(scores), 1) if scores else None
-        median = round(statistics.median(scores), 1) if scores else None
         high = max(scores) if scores else None
-        low_game = min(games, key=lambda g: g["score"]) if games else None
-        low = low_game["score"] if low_game else None
-        low_date = low_game["date"] if low_game else None
+        low = min(scores) if scores else None
         std = round(statistics.stdev(scores), 1) if len(scores) > 1 else 0.0
-
-        last5 = scores[-5:]
-        last5_avg = round(statistics.mean(last5), 1) if last5 else None
+        last5_avg = round(statistics.mean(scores[-5:]), 1) if scores else None
         form_delta = round(last5_avg - avg, 1) if (last5_avg is not None and avg is not None) else None
 
-        round_stats = compute_round_stats(api_hist)
-        scouting = generate_gameshow_scouting(name, avg, high, low, form_delta, win_counts[name], std, len(scores))
-
-        last_game_date = games[-1]["date_iso_dt"] if games else today
-        days_since_last_game = (today.date() - last_game_date.date()).days
-        last_win = last_win_date.get(name)
-        days_since_last_win = (today.date() - last_win.date()).days if last_win else None
-
-        recent_cutoff = last_game_date - timedelta(days=ACTIVE_WINDOW_DAYS)
-        recent_game_count = sum(1 for g in games if g["date_iso_dt"] >= recent_cutoff)
+        player_summary = {
+            "name": name,
+            "games_played": len(scores),
+            "season_avg": avg,
+            "high_score": high,
+            "low_score": low,
+            "std_dev": std,
+            "recent_form_delta": form_delta,
+            "wins": win_counts[name],
+        }
+        stats_for_ai.append(player_summary)
 
         person_stats.append({
             "name": name,
             "color": info["color"],
-            "verified": True,
             "games": len(scores),
             "avg": avg,
-            "median": median,
             "high": high,
             "low": low,
-            "low_date": low_date,
             "wins": win_counts[name],
-            "seconds": second_counts[name],
-            "losses": loss_counts[name],
-            "flags": 0,
-            "ghost_days": 0,
             "std": std,
-            "days_since_last_game": days_since_last_game,
-            "days_since_last_win": days_since_last_win,
-            "recent_game_count": recent_game_count,
-            "last5_avg": last5_avg,
             "form_delta": form_delta,
-            "nickname": scouting["nickname"],
-            "title": scouting["title"],
-            "scouting_good": scouting["good"],
-            "scouting_bad": scouting["bad"],
-            "blurb": scouting["blurb"],
-            **round_stats,
         })
 
+    # Call Gemini API
+    ai_results = generate_gemini_content(stats_for_ai)
+    scouting_map = {item["name"]: item for item in ai_results.get("scouting", [])}
+
+    for p in person_stats:
+        scout = scouting_map.get(p["name"], {})
+        p["nickname"] = scout.get("nickname", "Contender")
+        p["title"] = scout.get("title", f'"{p["name"]} the Competitor"')
+        p["blurb"] = scout.get("blurb", f"{p['name']} is holding down a {p['avg']} average this season.")
+        p["scouting_good"] = scout.get("good", "Solid map consistency across rounds.")
+        p["scouting_bad"] = scout.get("bad", "Needs to watch out for cold streaks.")
+
     series = [
-        {
-            "name": name,
-            "color": info["color"],
-            "data": [scores_by_date[cat].get(name) for cat in categories]
-        }
+        {"name": name, "color": info["color"], "data": [scores_by_date[cat].get(name) for cat in categories]}
         for name, info in PLAYERS.items()
     ]
-
-    raw_log = [
-        {"date": g["date"], "person": name, "score": g["score"], "flagged": g["_flagged"], "note": g["_note"]}
-        for name, games in all_games_by_player.items()
-        for g in games
-    ]
-    raw_log.sort(key=lambda r: (parse_label(r["date"], today.year), r["person"]), reverse=True)
-
-    all_scores = [r["score"] for r in raw_log]
-    group_stats = {
-        "total_days": len(categories),
-        "total_games": len(raw_log),
-        "group_avg": round(statistics.mean(all_scores), 1) if all_scores else 0,
-        "date_range": f"{categories[0]} - {categories[-1]}" if categories else "",
-    }
-
-    predictions = generate_gameshow_predictions(person_stats, categories)
 
     data["categories"] = categories
     data["series"] = series
     data["person_stats"] = person_stats
-    data["group_stats"] = group_stats
-    data["raw_log"] = raw_log
-    data["predictions"] = predictions
+    data["predictions"] = ai_results.get(
+        "predictions", 
+        "🔥 **Next Week's Predictions**: Ashley, Beth, and Kaitlyn are all preparing for an intense week of map showdowns!"
+    )
     data["generated_at"] = now_eastern.strftime("%B %-d, %Y at %I:%M %p")
 
     new_content = content[:match.start()] + prefix + json.dumps(data, indent=2, ensure_ascii=False) + suffix + content[match.end():]
     TARGET_FILE.write_text(new_content, encoding="utf-8")
-    print("Updated Scouting Reports and Next Week's Predictions with gameshow-style flair!")
+    print("Successfully updated stats and generated AI game-show commentary!")
 
 
 if __name__ == "__main__":
