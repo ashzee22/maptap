@@ -1,62 +1,23 @@
+
 #!/usr/bin/env python3
 """
 Pulls the latest MapTap scores for Ashley, Beth, and Kaitlyn and updates
 the `reportData` JSON embedded in fam/index.html.
-
-READ THIS BEFORE TOUCHING THE MERGE LOGIC
-------------------------------------------
-- The MapTap API returns each player's FULL gameHistory every time (keyed
-  by ISO date "YYYY-MM-DD"), not just new games. Each game has a
-  `finalScore` (the day's score) and a `rounds` list with a 0-100 `score`
-  per round - that's where hundreds/mode1-3/pos_avgs come from.
-
-- Dates shown on the site are "Mon D" strings with no year and no
-  leading zero ("Jul 30"), matching what's already in reportData. This
-  script keeps that convention. Known limitation: if this ever spans a
-  year boundary the labels become ambiguous (there's no year to break
-  the tie) - not handled here, would need a real rewrite to ISO-keyed
-  dates if that ever becomes a problem.
-
-- NON-DESTRUCTIVE MERGE, BY YOUR REQUEST: any (date, person) entry
-  already sitting in reportData's raw_log is NEVER modified or removed,
-  even if the API no longer returns it. We only ADD entries for dates
-  the API gives us that aren't already in raw_log. This also means we
-  never touch an existing entry's `flagged`/`note` (so hand-applied
-  cheating flags survive automated runs untouched), and nothing is ever
-  auto-added to cheating_incidents/cherry_pick_incidents - those stay
-  exactly as a human last left them.
-
-- Round-level stats (hundreds, mode1-3, pos_avgs) can only be computed
-  for games where we actually HAVE round data, i.e. games the API
-  returned this run. Older legacy entries that only exist as a
-  finalScore in raw_log (no round breakdown available) still count
-  toward games/avg/median/high/low/wins/etc, just not toward those
-  round-level stats.
-
-- Blurbs / nicknames ("The Final-Guess Futurist") / predictions /
-  suggested_storylines are hand-written flavor text in the original
-  data, not something derivable from stats alone. This script fills
-  them with simple template text instead of trying to match the
-  original writing style. There's a clear place below
-  (`generate_blurb`, `generate_predictions`) to swap in a real call to
-  the Anthropic API later if you want that back - ask me and I can wire
-  that up.
 """
 
 import json
 import statistics
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 
-TARGET_FILE = Path("fam/index.html")  # adjust to match your repo layout
+TARGET_FILE = Path("fam/index.html")  # adjust path if your repo layout differs
 
 API_URL = "https://us-central1-jjexperiment-12af6.cloudfunctions.net/getPublicProfile"
 
-# Order here also controls display order (chart legend, table rows, etc.)
 PLAYERS = {
     "Ashley": {"nickname": "ash_zee2", "color": "#d946ef"},
     "Beth": {"nickname": "MBZ", "color": "#38bdf8"},
@@ -64,7 +25,7 @@ PLAYERS = {
 }
 
 EASTERN = ZoneInfo("America/New_York")
-INACTIVE_AFTER_DAYS = 7  # players with no game in this long move to inactive_players
+INACTIVE_AFTER_DAYS = 7
 ACTIVE_WINDOW_DAYS = 5
 
 
@@ -80,7 +41,6 @@ def fetch_profile(nickname: str) -> dict:
     )
     resp.raise_for_status()
     payload = resp.json()
-    # Firebase callable functions wrap the real payload in {"result": {...}}
     return payload.get("result", payload)
 
 
@@ -90,7 +50,7 @@ def label_for(dt: datetime) -> str:
 
 
 def parse_label(label: str, year: int) -> datetime:
-    """Inverse of label_for(), given an assumed year (see module docstring)."""
+    """Inverse of label_for(), given an assumed year."""
     return datetime.strptime(f"{label} {year}", "%b %d %Y")
 
 
@@ -103,18 +63,43 @@ def extract_history(profile: dict) -> list[dict]:
     user = profile.get("user", {})
     game_history = user.get("gameHistory", {}) or {}
     history = []
-    for date_iso, game in game_history.items():
-        score = game.get("finalScore")
-        if score is None:
+
+    # MapTap returns gameHistory as a list/array of game objects
+    if isinstance(game_history, list):
+        games = game_history
+    elif isinstance(game_history, dict):
+        games = game_history.values()
+    else:
+        games = []
+
+    for game in games:
+        if not isinstance(game, dict):
             continue
-        dt = datetime.strptime(date_iso, "%Y-%m-%d")
-        rounds = [r["score"] for r in game.get("rounds", []) if "score" in r]
+
+        date_iso = game.get("date") or game.get("date_iso")
+        score = game.get("finalScore")
+
+        if score is None or not date_iso:
+            continue
+
+        try:
+            dt = datetime.strptime(date_iso, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        rounds = [
+            r["score"]
+            for r in game.get("rounds", [])
+            if isinstance(r, dict) and "score" in r
+        ]
+
         history.append({
             "date_iso": date_iso,
             "date": label_for(dt),
             "score": score,
             "rounds": rounds,
         })
+
     history.sort(key=lambda h: h["date_iso"])
     return history
 
@@ -124,7 +109,6 @@ def extract_history(profile: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def linear_trend(scores: list[float]) -> float | None:
-    """Least-squares slope of score vs game index. Points-per-game trend."""
     n = len(scores)
     if n < 2:
         return None
@@ -137,7 +121,6 @@ def linear_trend(scores: list[float]) -> float | None:
 
 
 def compute_round_stats(games_with_rounds: list[dict]) -> dict | None:
-    """hundreds / mode1-3 (+counts) / pos_avgs, from games that HAVE round data."""
     games = [g for g in games_with_rounds if g.get("rounds")]
     if not games:
         return None
@@ -174,12 +157,11 @@ def empty_person_stats(name: str, color: str) -> dict:
         "mode1": None, "mode1_count": None, "mode2": None, "mode2_count": None,
         "mode3": None, "mode3_count": None,
         "nickname": "Just Joined",
-        "blurb": "Just joined the family roster \u2014 first game pending!",
+        "blurb": "Just joined the family roster — first game pending!",
     }
 
 
 def generate_blurb(name: str, stats: dict) -> tuple[str, str]:
-    """Cheap template nickname + blurb from stats. Swap for an LLM call if wanted."""
     if stats["form_delta"] is not None and stats["form_delta"] > 20:
         nickname = "On a Heater"
         blurb = (
@@ -206,14 +188,6 @@ def compute_person_stats(name: str, color: str, all_time_games: list[dict],
                           api_history: list[dict], today: datetime,
                           win_counts: dict, second_counts: dict, loss_counts: dict,
                           last_win_date: datetime | None, badges: dict | None) -> dict:
-    """
-    all_time_games: every known game for this player (legacy raw_log entries
-        that only have a finalScore, PLUS this run's full API history), each
-        as {"date": "Jul 30", "date_iso": ..., "score": int, "rounds": [...] (optional)}
-        sorted oldest -> newest.
-    api_history: just this run's fresh API pull (has round data), used for
-        the round-level stats.
-    """
     if not all_time_games:
         return empty_person_stats(name, color)
 
@@ -257,8 +231,8 @@ def compute_person_stats(name: str, color: str, all_time_games: list[dict],
         "wins": win_counts.get(name, 0),
         "seconds": second_counts.get(name, 0),
         "losses": loss_counts.get(name, 0),
-        "flags": 0,       # cheating flags are human-applied only, never automated
-        "ghost_days": 0,  # not derivable from the API; leave for manual tracking
+        "flags": 0,
+        "ghost_days": 0,
         "std": round(statistics.stdev(scores), 1) if len(scores) > 1 else 0.0,
         "days_since_last_game": days_since_last_game,
         "days_since_last_win": days_since_last_win,
@@ -285,7 +259,7 @@ def best_weekday(all_time_games: list[dict]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Execution
 # ---------------------------------------------------------------------------
 
 def main():
@@ -302,25 +276,33 @@ def main():
     now_eastern = datetime.now(EASTERN)
     today = now_eastern.replace(tzinfo=None)
 
-    # --- 1. Existing raw_log, so we know what NOT to touch ------------------
-    existing_by_player = defaultdict(dict)  # player -> {date_label: entry}
+    # 1. Existing raw_log (preserves legacy entries not on MapTap)
+    existing_by_player = defaultdict(dict)
     for entry in data.get("raw_log", []):
         existing_by_player[entry["person"]][entry["date"]] = entry
 
-    # --- 2. Pull fresh data per player, merge non-destructively -------------
-    all_games_by_player = {}      # player -> full chronological game list
-    api_history_by_player = {}    # player -> this run's fresh API history (has rounds)
+    # 2. Pull fresh data per player, merge non-destructively
+    all_games_by_player = {}
+    api_history_by_player = {}
     badges_by_player = {}
 
     for name, info in PLAYERS.items():
-        profile = fetch_profile(info["nickname"])
-        api_history = extract_history(profile)
+        try:
+            profile = fetch_profile(info["nickname"])
+            api_history = extract_history(profile)
+            badges = (profile.get("user", {}) or {}).get("badges")
+        except Exception as e:
+            print(f"Warning: Failed to fetch {name} ({info['nickname']}): {e}")
+            api_history = []
+            badges = None
+
         api_history_by_player[name] = api_history
-        badges_by_player[name] = (profile.get("user", {}) or {}).get("badges")
+        badges_by_player[name] = badges
 
         existing_dates = existing_by_player[name]
         merged = []
-        # legacy entries the API no longer confirms - keep untouched, no rounds
+        
+        # Keep legacy entries that MapTap API no longer returns
         for date_label, entry in existing_dates.items():
             if date_label not in {g["date"] for g in api_history}:
                 merged.append({
@@ -332,9 +314,8 @@ def main():
                     "_note": entry.get("note"),
                     "_is_new": False,
                 })
-        # fresh API entries (new dates get flagged/note reset; dates that
-        # already existed keep their prior flagged/note so hand-applied
-        # cheating flags survive)
+                
+        # Merge fresh API entries
         for g in api_history:
             prior = existing_dates.get(g["date"])
             merged.append({
@@ -349,13 +330,13 @@ def main():
         merged.sort(key=lambda g: g["date_iso_dt"])
         all_games_by_player[name] = merged
 
-    # --- 3. Categories (union of every date anyone has, chronological) ------
+    # 3. Categories
     all_dates = {g["date_iso_dt"]: g["date"] for games in all_games_by_player.values() for g in games}
     ordered_dts = sorted(all_dates.keys())
     categories = [all_dates[dt] for dt in ordered_dts]
 
-    # --- 4. Daily win/second/loss tallies ------------------------------------
-    scores_by_date = defaultdict(dict)  # date_label -> {player: score}
+    # 4. Daily win/second/loss tallies
+    scores_by_date = defaultdict(dict)
     for name, games in all_games_by_player.items():
         for g in games:
             scores_by_date[g["date"]][name] = g["score"]
@@ -384,7 +365,7 @@ def main():
                 if s == bottom and bottom != top:
                     loss_counts[p] += 1
 
-    # --- 5. Per-person stats -------------------------------------------------
+    # 5. Per-person stats
     person_stats = []
     for name, info in PLAYERS.items():
         games = all_games_by_player[name]
@@ -395,7 +376,7 @@ def main():
         )
         person_stats.append(stats)
 
-    # --- 6. Series / boxplot --------------------------------------------------
+    # 6. Series / boxplot
     series = []
     for name, info in PLAYERS.items():
         by_date = {g["date"]: g["score"] for g in all_games_by_player[name]}
@@ -413,7 +394,7 @@ def main():
         q = statistics.quantiles(scores, n=4, method="inclusive") if len(scores) > 1 else [scores[0]] * 3
         boxplot.append({"x": name, "y": [scores[0], round(q[0]), round(statistics.median(scores)), round(q[2]), scores[-1]]})
 
-    # --- 7. Raw log (rebuilt from the merged per-player games) ---------------
+    # 7. Raw log
     raw_log = []
     for name, games in all_games_by_player.items():
         for g in games:
@@ -426,7 +407,7 @@ def main():
             })
     raw_log.sort(key=lambda r: (parse_label(r["date"], today.year), r["person"]), reverse=True)
 
-    # --- 8. Group stats --------------------------------------------------------
+    # 8. Group stats
     all_scores = [r["score"] for r in raw_log]
     group_stats = {
         "total_days": len(categories),
@@ -435,7 +416,7 @@ def main():
         "date_range": f"{categories[0]} - {categories[-1]}" if categories else "",
     }
 
-    # --- 9. Recent winners (last 4 real days + a provisional "Today") --------
+    # 9. Recent winners
     recent_winners = []
     for offset in range(4, 0, -1):
         d = today - timedelta(days=offset)
@@ -451,7 +432,7 @@ def main():
     today_label_date = label_for(today)
     recent_winners.append({"label": "Today", "date": today_label_date, "winners": [], "score": None, "provisional": True})
 
-    # --- 10. Predictions pack (template-based, see module docstring) ---------
+    # 10. Predictions pack
     active_players, inactive_players = [], []
     for stats in person_stats:
         if stats["games"] == 0:
@@ -498,13 +479,6 @@ def main():
         "active_window_days": ACTIVE_WINDOW_DAYS,
         "active_players": active_players,
         "inactive_players": inactive_players,
-        "inactive_players_rule": (
-            "Players in inactive_players have NOT played recently. You may "
-            "mention at most ONE of them, and ONLY to note how long they've "
-            "been gone and build anticipation for their return - never claim "
-            "recent form, a hot streak, momentum, or any current-performance "
-            "angle for them."
-        ),
         "all_time_record": all_time_record,
         "suggested_storylines": storylines[:4],
     }
@@ -527,7 +501,7 @@ def main():
             "reason": "showing the strongest recent form",
         }
 
-    # --- 11. Assemble and write back -------------------------------------------
+    # 11. Write back
     data["categories"] = categories
     data["series"] = series
     data["person_stats"] = person_stats
@@ -538,7 +512,6 @@ def main():
     data["tomorrow_guess"] = tomorrow_guess
     data["predictions"] = predictions
     data["predictions_pack"] = predictions_pack
-    # never touched by automation - human-curated only:
     data.setdefault("cheating_incidents", [])
     data.setdefault("cherry_pick_incidents", [])
     data.setdefault("head_to_head", {})
