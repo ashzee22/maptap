@@ -1,36 +1,37 @@
-name: Update MapTap Scores
+name: Daily Scores & AI Update
 
 on:
   schedule:
-    # Runs every hour at the top of the hour
-    - cron: '0 * * * *'
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
+    # 14:00 UTC = 10:00 AM EDT
+    # 20:00 UTC = 4:00 PM EDT
+    - cron: '0 14,20 * * *'
+  workflow_dispatch: # Allows manual triggers from the GitHub Actions tab
 
 jobs:
-  update:
+  update-scores:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
-
-      - name: Pull latest scores and update site
-        run: python scripts/update_scores
-
-      - name: Commit and push if anything changed
+      - name: Install Dependencies
         run: |
-          git config user.name "maptap-bot"
-          git config user.email "actions@github.com"
-          git add -A
-          git diff --staged --quiet || git commit -m "Auto-update MapTap scores"
-          git push
+          python -m pip install --upgrade pip
+          pip install requests google-genai
+
+      - name: Run Update Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/update_scores.py
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Automated daily update via Gemini" && git push)
