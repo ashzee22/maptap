@@ -236,7 +236,7 @@ def generate_gameshow_predictions(person_stats: list[dict], categories: list[str
     high_game_player = max(active, key=lambda x: x.get("high") or 0)
 
     prediction_text = (
-        f"🔥 **Next Week's Predictions**: {top_player['name']} enters the arena as the heavy favorite holding a commanding {top_player['avg']:.1f} average, "
+        f"{top_player['name']} enters the arena as the heavy favorite holding a commanding {top_player['avg']:.1f} average, "
         f"but the pressure is boiling over! {hot_player['name']} is generating explosive heat on recent form, "
         f"while {high_game_player['name']} lurks with a group-best {high_game_player['high']} high-score ceiling. "
         f"Expect sparks to fly in the next multi-player showdown as the leaderboard crown hangs in the balance!"
