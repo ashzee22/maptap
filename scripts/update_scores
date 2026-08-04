@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Pulls latest MapTap scores for Ashley, Beth, and Kaitlyn.
-Calculates all player statistics across ALL games, but restricts WINS 
-to days where 2 or more players submitted scores.
+Pulls MapTap scores for Ashley, Beth, and Kaitlyn.
+- Stats board uses ALL games for player averages, medians, highs, lows, etc.
+- Wins, seconds, and losses ONLY count on days where >= 2 players submitted scores.
+- Dynamic game-show style scouting reports & predictions matching the classic vibe!
 """
 
 import json
@@ -32,7 +33,7 @@ ACTIVE_WINDOW_DAYS = 5
 
 
 # ---------------------------------------------------------------------------
-# API & Data Extraction
+# API & Parsing
 # ---------------------------------------------------------------------------
 
 def fetch_profile(nickname: str) -> dict:
@@ -139,64 +140,112 @@ def compute_round_stats(games_with_rounds: list[dict]) -> dict:
     }
 
 
-def generate_scouting_report(name: str, avg: float | None, high: int | None, low: int | None, 
-                             form_delta: float | None, wins: int, std: float | None) -> dict:
-    if avg is None:
+# ---------------------------------------------------------------------------
+# Gameshow Scouting Report Generator
+# ---------------------------------------------------------------------------
+
+def generate_gameshow_scouting(name: str, avg: float | None, high: int | None, low: int | None, 
+                               form_delta: float | None, wins: int, std: float | None, games_count: int) -> dict:
+    if avg is None or games_count == 0:
         return {
             "nickname": "Rookie Wildcard",
-            "title": "The Wildcard Mystery ❓",
-            "good": "Completely unpredictable; zero scouting film on their game.",
-            "bad": "Has not logged an official match yet.",
-            "blurb": f"{name} is waiting in the wings to make their official debut."
+            "title": f'"{name} the Mystery Contender"',
+            "blurb": f"{name} is currently a phantom on the board with zero games logged! The crowd is waiting with bated breath to see if they debut with absolute glory or total map-reading mayhem.",
+            "good": "Zero scouting film for rivals to analyze.",
+            "bad": "Has yet to step up to the podium and drop a score."
         }
 
-    if form_delta is not None and form_delta >= 15:
+    # Dynamic Game-Show Player Titles
+    if avg >= 800:
+        nickname = "Triple-Point Titan"
+        title = f'"{name} the Map-Monarch"'
+    elif form_delta is not None and form_delta >= 15:
         nickname = "On a Heater"
-        title = "The Hot Streak Sniper 🔥"
+        title = f'"{name} the Hot-Hand Heavyweight"'
     elif form_delta is not None and form_delta <= -15:
         nickname = "Cooling Off"
-        title = "The Ice Cold Maverick 🧊"
+        title = f'"{name} the Slump Survivor"'
     elif std is not None and std > 45:
         nickname = "Wild Card"
-        title = "The Rollercoaster Specialist 🎢"
+        title = f'"{name} the Volatile Maverick"'
     elif wins >= 3:
         nickname = "Clutch Leader"
-        title = "The Apex Competitor 👑"
+        title = f'"{name} the Head-to-Head Executioner"'
     else:
-        nickname = "Steady Hand"
-        title = "The Calculating Strategist ⚡"
+        nickname = "Underdog Contender"
+        title = f'"{name} the Dark-Horse Disruptor"'
 
+    # Rich Game-Show Narrative Blurb
+    delta_str = f"+{form_delta}" if (form_delta is not None and form_delta > 0) else f"{form_delta}"
+    
+    if avg >= 800:
+        blurb = (
+            f"{name} stands as an absolute juggernaut on the stage, holding down a terrifying {avg:.1f} season average "
+            f"and throwing around a jaw-dropping peak score of {high}! "
+            f"Rivals shudder whenever they walk up to the map, though weathering a recent trend of {delta_str} points "
+            f"proves that even high-flying royalty isn't totally immune to the occasional cold breeze."
+        )
+    elif std is not None and std > 40:
+        blurb = (
+            f"Talk about high-stakes drama! {name} brings pure, unfiltered chaos to every round with a wild {std:.1f} standard deviation. "
+            f"They can electrify the room with a massive {high}-point masterpiece or send spectators gasping with a {low}-point disaster. "
+            f"A true roller-coaster player averaging {avg:.1f} who keeps every single match unpredictable!"
+        )
+    else:
+        blurb = (
+            f"{name} continues to quietly calculate their way up the leaderboards, carrying a respectable {avg:.1f} season average "
+            f"across {games_count} intense battles. Holding a peak of {high} points, they have shown flashes of pure brilliance, "
+            f"now sitting on {wins} official head-to-head victory crowns as they search for absolute consistency."
+        )
+
+    # Distinct Good & Bad Highlights
     if high and high >= 850:
-        good = f"Sky-high ceiling: capable of explosion games up to {high} pts."
+        good = f"Unlimited firepower—capable of dropping terrifying {high}+ point nuclear scores."
     elif form_delta is not None and form_delta > 0:
-        good = f"Riding great momentum (+{form_delta} pts over season average recently)."
+        good = f"Riding serious momentum with a +{form_delta} boost over their standard average."
     elif wins > 0:
-        good = f"Proven clutch performer with {wins} multi-player match wins."
+        good = f"Clutch instinct in multi-player showdowns, bagging {wins} official head-to-head wins."
     else:
-        good = f"Consistent performer holding down a {avg} season average."
+        good = f"Solid baseline consistency anchoring a respectable {avg:.1f} point average."
 
-    if low and low < 500:
-        bad = f"Prone to sudden floor drops (season low: {low})."
+    if low and low < 550:
+        bad = f"Prone to catastrophic map-reading meltdowns (dipping down to a season low of {low})."
     elif form_delta is not None and form_delta < 0:
-        bad = f"Slight slump lately ({form_delta} pts below season pace)."
+        bad = f"Currently leaking points, running {form_delta} below their usual seasonal pace."
     elif std is not None and std > 35:
-        bad = f"High game-to-game variance ({std} std dev)."
+        bad = f"High game-to-game volatility ({std:.1f} std dev) makes every performance a gamble."
     else:
-        bad = f"Can play overly safe when head-to-head pressure builds."
-
-    blurb = f"{name} holds a {avg} season average with a peak score of {high}."
+        bad = f"Can play overly conservative when head-to-head scoreboard pressure heats up."
 
     return {
         "nickname": nickname,
         "title": title,
+        "blurb": blurb,
         "good": good,
         "bad": bad,
-        "blurb": blurb,
     }
 
 
+def generate_gameshow_predictions(person_stats: list[dict], categories: list[str]) -> str:
+    active = [p for p in person_stats if p.get("avg") is not None and p.get("games", 0) > 0]
+    if not active:
+        return "The arena is completely quiet! Awaiting initial scores before the forecasting computers can compute the upcoming drama."
+
+    top_player = max(active, key=lambda x: x["avg"])
+    hot_player = max(active, key=lambda x: x.get("form_delta") or -999)
+    high_game_player = max(active, key=lambda x: x.get("high") or 0)
+
+    prediction_text = (
+        f"🔥 **Next Week's Predictions**: {top_player['name']} enters the arena as the heavy favorite holding a commanding {top_player['avg']:.1f} average, "
+        f"but the pressure is boiling over! {hot_player['name']} is generating explosive heat on recent form, "
+        f"while {high_game_player['name']} lurks with a group-best {high_game_player['high']} high-score ceiling. "
+        f"Expect sparks to fly in the next multi-player showdown as the leaderboard crown hangs in the balance!"
+    )
+    return prediction_text
+
+
 # ---------------------------------------------------------------------------
-# Main Execution
+# Main Routine
 # ---------------------------------------------------------------------------
 
 def main():
@@ -270,7 +319,7 @@ def main():
         for g in games:
             scores_by_date[g["date"]][name] = g["score"]
 
-    # 1. WINS/SECONDS/LOSSES: Restricted to days with >= 2 players
+    # 1. WINS: Restricted strictly to dates with >= 2 players
     win_counts, second_counts, loss_counts = defaultdict(int), defaultdict(int), defaultdict(int)
     last_win_date = {}
 
@@ -278,7 +327,6 @@ def main():
         date_label = all_dates[dt]
         day_scores = scores_by_date.get(date_label, {})
         
-        # Win condition check (must have at least 2 players logged on that day)
         if len(day_scores) < 2:
             continue
 
@@ -299,11 +347,11 @@ def main():
             if s == bottom and bottom != top:
                 loss_counts[p] += 1
 
-    # 2. PLAYER STATS BOARD: Calculated across ALL games for each player
+    # 2. STATS BOARD: Takes ALL games into account for each player
     person_stats = []
     for name, info in PLAYERS.items():
         games = all_games_by_player[name]
-        scores = [g["score"] for g in games]  # Takes ALL games into account
+        scores = [g["score"] for g in games]
         api_hist = api_history_by_player[name]
 
         avg = round(statistics.mean(scores), 1) if scores else None
@@ -319,7 +367,7 @@ def main():
         form_delta = round(last5_avg - avg, 1) if (last5_avg is not None and avg is not None) else None
 
         round_stats = compute_round_stats(api_hist)
-        scouting = generate_scouting_report(name, avg, high, low, form_delta, win_counts[name], std)
+        scouting = generate_gameshow_scouting(name, avg, high, low, form_delta, win_counts[name], std, len(scores))
 
         last_game_date = games[-1]["date_iso_dt"] if games else today
         days_since_last_game = (today.date() - last_game_date.date()).days
@@ -333,13 +381,13 @@ def main():
             "name": name,
             "color": info["color"],
             "verified": True,
-            "games": len(scores),  # All games played
-            "avg": avg,            # All games avg
-            "median": median,      # All games median
-            "high": high,          # All games high score
-            "low": low,            # All games low score
+            "games": len(scores),
+            "avg": avg,
+            "median": median,
+            "high": high,
+            "low": low,
             "low_date": low_date,
-            "wins": win_counts[name],  # ONLY 2+ player matches count
+            "wins": win_counts[name],
             "seconds": second_counts[name],
             "losses": loss_counts[name],
             "flags": 0,
@@ -382,15 +430,7 @@ def main():
         "date_range": f"{categories[0]} - {categories[-1]}" if categories else "",
     }
 
-    top_player = max([p for p in person_stats if p["avg"] is not None], key=lambda x: x["avg"], default=None)
-    hot_player = max([p for p in person_stats if p["form_delta"] is not None], key=lambda x: x["form_delta"], default=None)
-
-    predictions = (
-        f"🔥 **AI Predictions**: {top_player['name']} enters as the favorite with a group-leading {top_player['avg']} average. "
-        f"Keep an eye on {hot_player['name']}, who is trending with a {hot_player['form_delta']:+} form delta over their last 5 games!"
-        if top_player and hot_player
-        else "Awaiting more head-to-head matches to form next week's predictions."
-    )
+    predictions = generate_gameshow_predictions(person_stats, categories)
 
     data["categories"] = categories
     data["series"] = series
@@ -402,7 +442,7 @@ def main():
 
     new_content = content[:match.start()] + prefix + json.dumps(data, indent=2, ensure_ascii=False) + suffix + content[match.end():]
     TARGET_FILE.write_text(new_content, encoding="utf-8")
-    print("Updated stats board using all games for overall metrics and 2+ players for Wins.")
+    print("Updated Scouting Reports and Next Week's Predictions with gameshow-style flair!")
 
 
 if __name__ == "__main__":
