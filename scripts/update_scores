@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Pulls latest MapTap scores for Ashley, Beth, and Kaitlyn, enforces multi-player 
-win rules, updates player scouting reports, generated predictions, and writes 
-back to index.html.
+Pulls latest MapTap scores for Ashley, Beth, and Kaitlyn.
+Calculates all player statistics across ALL games, but restricts WINS 
+to days where 2 or more players submitted scores.
 """
 
 import json
@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-# Locate index.html relative to script path
 SCRIPT_DIR = Path(__file__).parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
 TARGET_FILE = REPO_ROOT / "index.html"
@@ -33,7 +32,7 @@ ACTIVE_WINDOW_DAYS = 5
 
 
 # ---------------------------------------------------------------------------
-# API & Parsing
+# API & Data Extraction
 # ---------------------------------------------------------------------------
 
 def fetch_profile(nickname: str) -> dict:
@@ -103,82 +102,101 @@ def extract_history(profile: dict) -> list[dict]:
     return history
 
 
-# ---------------------------------------------------------------------------
-# Scouting Report Generator
-# ---------------------------------------------------------------------------
+def compute_round_stats(games_with_rounds: list[dict]) -> dict:
+    games = [g for g in games_with_rounds if g.get("rounds")]
+    if not games:
+        return {
+            "hundreds": 0,
+            "mode1": None, "mode1_count": None,
+            "mode2": None, "mode2_count": None,
+            "mode3": None, "mode3_count": None,
+            "pos_avgs": [],
+        }
 
-def generate_fun_scouting_report(name: str, avg: float | None, high: int | None, low: int | None, 
-                                 form_delta: float | None, wins: int, std: float | None) -> dict:
+    freq = Counter()
+    position_scores = defaultdict(list)
+    hundreds = 0
+
+    for game in games:
+        for i, rscore in enumerate(game["rounds"]):
+            freq[rscore] += 1
+            position_scores[i].append(rscore)
+            if rscore == 100:
+                hundreds += 1
+
+    top3 = freq.most_common(3)
+    while len(top3) < 3:
+        top3.append((None, None))
+
+    pos_avgs = [round(statistics.mean(position_scores[i]), 1) for i in sorted(position_scores)]
+
+    return {
+        "hundreds": hundreds,
+        "mode1": top3[0][0], "mode1_count": top3[0][1],
+        "mode2": top3[1][0], "mode2_count": top3[1][1],
+        "mode3": top3[2][0], "mode3_count": top3[2][1],
+        "pos_avgs": pos_avgs,
+    }
+
+
+def generate_scouting_report(name: str, avg: float | None, high: int | None, low: int | None, 
+                             form_delta: float | None, wins: int, std: float | None) -> dict:
     if avg is None:
         return {
+            "nickname": "Rookie Wildcard",
             "title": "The Wildcard Mystery ❓",
-            "good": "Completely unpredictable; opponents have zero film on them.",
-            "bad": "Hasn't actually logged a score yet.",
+            "good": "Completely unpredictable; zero scouting film on their game.",
+            "bad": "Has not logged an official match yet.",
             "blurb": f"{name} is waiting in the wings to make their official debut."
         }
 
-    # Dynamic Fun Title Generation
     if form_delta is not None and form_delta >= 15:
-        title = "The Untouchable Flame 🔥"
+        nickname = "On a Heater"
+        title = "The Hot Streak Sniper 🔥"
     elif form_delta is not None and form_delta <= -15:
-        title = "The Cold Front 🧊"
-    elif std is not None and std > 40:
+        nickname = "Cooling Off"
+        title = "The Ice Cold Maverick 🧊"
+    elif std is not None and std > 45:
+        nickname = "Wild Card"
         title = "The Rollercoaster Specialist 🎢"
-    elif wins >= 5:
-        title = "The Reigning Apex Predator 👑"
-    elif avg >= 500:
-        title = "The Sharpshooting Maverick 🎯"
+    elif wins >= 3:
+        nickname = "Clutch Leader"
+        title = "The Apex Competitor 👑"
     else:
-        title = "The Calculating Underdog ⚡"
+        nickname = "Steady Hand"
+        title = "The Calculating Strategist ⚡"
 
-    # Good Thing (Strength)
-    if high and high >= 600:
-        good = f"Ceiling is astronomical—capable of dropping massive {high}+ point bombs."
+    if high and high >= 850:
+        good = f"Sky-high ceiling: capable of explosion games up to {high} pts."
     elif form_delta is not None and form_delta > 0:
-        good = f"Riding strong momentum (+{form_delta} pts above average in recent games)."
+        good = f"Riding great momentum (+{form_delta} pts over season average recently)."
     elif wins > 0:
-        good = f"Proven clutch factor with {wins} head-to-head victories under pressure."
+        good = f"Proven clutch performer with {wins} multi-player match wins."
     else:
-        good = f"Rock-solid baseline consistency with an average of {avg} points."
+        good = f"Consistent performer holding down a {avg} season average."
 
-    # Bad Thing (Weakness)
-    if low and low < 300:
-        bad = f"Prone to catastrophic floor games (season low of {low})."
+    if low and low < 500:
+        bad = f"Prone to sudden floor drops (season low: {low})."
     elif form_delta is not None and form_delta < 0:
-        bad = f"Currently slumping ({form_delta} pts below season average)."
+        bad = f"Slight slump lately ({form_delta} pts below season pace)."
     elif std is not None and std > 35:
-        bad = f"High variance and erratic round-to-round scoring patterns."
+        bad = f"High game-to-game variance ({std} std dev)."
     else:
-        bad = f"Can play overly conservative when head-to-head pressure rises."
+        bad = f"Can play overly safe when head-to-head pressure builds."
 
-    blurb = f"{name} holds a {avg} season average across matches, rocking a high of {high}."
-
-    return {"title": title, "good": good, "bad": bad, "blurb": blurb}
-
-
-def generate_predictions(person_stats: list[dict], categories: list[str]) -> dict:
-    active = [p for p in person_stats if p.get("avg") is not None]
-    if not active:
-        return {"summary": "Awaiting baseline scores before making predictions.", "matchups": []}
-
-    leader = max(active, key=lambda p: p["avg"])
-    heater = max(active, key=lambda p: p.get("form_delta") or -999)
-
-    summary = (
-        f"⚡ **AI Spotlight**: {leader['name']} currently dominates the leaderboards at {leader['avg']} AVG, "
-        f"but {heater['name']} is generating serious heat on recent form! Expect volatile shifts next week."
-    )
+    blurb = f"{name} holds a {avg} season average with a peak score of {high}."
 
     return {
-        "summary": summary,
-        "as_of": categories[-1] if categories else "N/A",
-        "projected_favorite": leader["name"],
-        "dark_horse": heater["name"] if heater["name"] != leader["name"] else "The Field"
+        "nickname": nickname,
+        "title": title,
+        "good": good,
+        "bad": bad,
+        "blurb": blurb,
     }
 
 
 # ---------------------------------------------------------------------------
-# Main Routine
+# Main Execution
 # ---------------------------------------------------------------------------
 
 def main():
@@ -247,13 +265,12 @@ def main():
     ordered_dts = sorted(all_dates.keys())
     categories = [all_dates[dt] for dt in ordered_dts]
 
-    # Map daily scores across players
     scores_by_date = defaultdict(dict)
     for name, games in all_games_by_player.items():
         for g in games:
             scores_by_date[g["date"]][name] = g["score"]
 
-    # --- RULE UPDATE: Only count wins/seconds/losses if >= 2 players played ---
+    # 1. WINS/SECONDS/LOSSES: Restricted to days with >= 2 players
     win_counts, second_counts, loss_counts = defaultdict(int), defaultdict(int), defaultdict(int)
     last_win_date = {}
 
@@ -261,7 +278,7 @@ def main():
         date_label = all_dates[dt]
         day_scores = scores_by_date.get(date_label, {})
         
-        # Enforce multi-player participation requirement (at least 2 players)
+        # Win condition check (must have at least 2 players logged on that day)
         if len(day_scores) < 2:
             continue
 
@@ -282,37 +299,63 @@ def main():
             if s == bottom and bottom != top:
                 loss_counts[p] += 1
 
+    # 2. PLAYER STATS BOARD: Calculated across ALL games for each player
     person_stats = []
     for name, info in PLAYERS.items():
         games = all_games_by_player[name]
-        scores = [g["score"] for g in games]
-        
+        scores = [g["score"] for g in games]  # Takes ALL games into account
+        api_hist = api_history_by_player[name]
+
         avg = round(statistics.mean(scores), 1) if scores else None
+        median = round(statistics.median(scores), 1) if scores else None
         high = max(scores) if scores else None
-        low = min(scores) if scores else None
+        low_game = min(games, key=lambda g: g["score"]) if games else None
+        low = low_game["score"] if low_game else None
+        low_date = low_game["date"] if low_game else None
         std = round(statistics.stdev(scores), 1) if len(scores) > 1 else 0.0
 
         last5 = scores[-5:]
         last5_avg = round(statistics.mean(last5), 1) if last5 else None
         form_delta = round(last5_avg - avg, 1) if (last5_avg is not None and avg is not None) else None
 
-        scouting = generate_fun_scouting_report(name, avg, high, low, form_delta, win_counts[name], std)
+        round_stats = compute_round_stats(api_hist)
+        scouting = generate_scouting_report(name, avg, high, low, form_delta, win_counts[name], std)
+
+        last_game_date = games[-1]["date_iso_dt"] if games else today
+        days_since_last_game = (today.date() - last_game_date.date()).days
+        last_win = last_win_date.get(name)
+        days_since_last_win = (today.date() - last_win.date()).days if last_win else None
+
+        recent_cutoff = last_game_date - timedelta(days=ACTIVE_WINDOW_DAYS)
+        recent_game_count = sum(1 for g in games if g["date_iso_dt"] >= recent_cutoff)
 
         person_stats.append({
             "name": name,
             "color": info["color"],
-            "games": len(scores),
-            "avg": avg,
-            "high": high,
-            "low": low,
-            "wins": win_counts[name],
+            "verified": True,
+            "games": len(scores),  # All games played
+            "avg": avg,            # All games avg
+            "median": median,      # All games median
+            "high": high,          # All games high score
+            "low": low,            # All games low score
+            "low_date": low_date,
+            "wins": win_counts[name],  # ONLY 2+ player matches count
             "seconds": second_counts[name],
             "losses": loss_counts[name],
+            "flags": 0,
+            "ghost_days": 0,
+            "std": std,
+            "days_since_last_game": days_since_last_game,
+            "days_since_last_win": days_since_last_win,
+            "recent_game_count": recent_game_count,
+            "last5_avg": last5_avg,
             "form_delta": form_delta,
+            "nickname": scouting["nickname"],
             "title": scouting["title"],
             "scouting_good": scouting["good"],
             "scouting_bad": scouting["bad"],
             "blurb": scouting["blurb"],
+            **round_stats,
         })
 
     series = [
@@ -331,16 +374,35 @@ def main():
     ]
     raw_log.sort(key=lambda r: (parse_label(r["date"], today.year), r["person"]), reverse=True)
 
+    all_scores = [r["score"] for r in raw_log]
+    group_stats = {
+        "total_days": len(categories),
+        "total_games": len(raw_log),
+        "group_avg": round(statistics.mean(all_scores), 1) if all_scores else 0,
+        "date_range": f"{categories[0]} - {categories[-1]}" if categories else "",
+    }
+
+    top_player = max([p for p in person_stats if p["avg"] is not None], key=lambda x: x["avg"], default=None)
+    hot_player = max([p for p in person_stats if p["form_delta"] is not None], key=lambda x: x["form_delta"], default=None)
+
+    predictions = (
+        f"🔥 **AI Predictions**: {top_player['name']} enters as the favorite with a group-leading {top_player['avg']} average. "
+        f"Keep an eye on {hot_player['name']}, who is trending with a {hot_player['form_delta']:+} form delta over their last 5 games!"
+        if top_player and hot_player
+        else "Awaiting more head-to-head matches to form next week's predictions."
+    )
+
     data["categories"] = categories
     data["series"] = series
     data["person_stats"] = person_stats
+    data["group_stats"] = group_stats
     data["raw_log"] = raw_log
-    data["predictions_pack"] = generate_predictions(person_stats, categories)
+    data["predictions"] = predictions
     data["generated_at"] = now_eastern.strftime("%B %-d, %Y at %I:%M %p")
 
     new_content = content[:match.start()] + prefix + json.dumps(data, indent=2, ensure_ascii=False) + suffix + content[match.end():]
     TARGET_FILE.write_text(new_content, encoding="utf-8")
-    print(f"Updated {TARGET_FILE} successfully with multi-player win rules & dynamic AI scouting!")
+    print("Updated stats board using all games for overall metrics and 2+ players for Wins.")
 
 
 if __name__ == "__main__":
